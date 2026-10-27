@@ -1,0 +1,8 @@
+{
+  "name": "MPSC Pragati - Zero-Cost Exam Prep",
+  "description": "Complete mobile-first MPSC exam preparation companion with bilingual Marathi & English support, syllabus tracker, daily timetable, realistic MCQs with explanations, notes, and study streak analytics.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
