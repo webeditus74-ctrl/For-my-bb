@@ -23,6 +23,7 @@ const STORAGE_KEYS = {
   BOOKMARKED_MCQ_IDS: 'mpsc_bookmarked_mcqs_v1',
   DAILY_LOGS: 'mpsc_daily_logs_v1',
   ACHIEVEMENTS: 'mpsc_achievements_v1',
+  RECENT_ATTEMPTED_MCQS: 'mpsc_recent_attempted_mcq_ids_v1',
 };
 
 // Safe JSON parser
@@ -111,6 +112,24 @@ export const storage = {
     const history = storage.getTestHistory();
     const updated = [session, ...history].slice(0, 50); // Keep last 50 tests
     safeSet(STORAGE_KEYS.TEST_HISTORY, updated);
+  },
+
+  // Recent Attempted Question IDs (for duplicate prevention across quiz sessions)
+  getRecentAttemptedQuestionIds: (): string[] => {
+    const raw = safeGet<unknown>(STORAGE_KEYS.RECENT_ATTEMPTED_MCQS, []);
+    if (!Array.isArray(raw)) return [];
+    return raw.filter((id): id is string => typeof id === 'string' && id.trim().length > 0);
+  },
+  recordAttemptedQuestionIds: (ids: string[]): void => {
+    if (!Array.isArray(ids) || ids.length === 0) return;
+    const current = storage.getRecentAttemptedQuestionIds();
+    const combined = [...ids, ...current];
+    // Keep up to 200 distinct IDs
+    const unique = Array.from(new Set(combined)).slice(0, 200);
+    safeSet(STORAGE_KEYS.RECENT_ATTEMPTED_MCQS, unique);
+  },
+  clearRecentAttemptedQuestionIds: (): void => {
+    safeSet(STORAGE_KEYS.RECENT_ATTEMPTED_MCQS, []);
   },
 
   // Notes

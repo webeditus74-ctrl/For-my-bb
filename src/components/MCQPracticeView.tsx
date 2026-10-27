@@ -16,13 +16,16 @@ import {
   Eye, 
   EyeOff,
   Flame,
-  Check
+  Check,
+  RefreshCw,
+  Info
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
 import { MCQQuestion, Language, TestSession, QuestionAnswerRecord } from '../types';
 import { translations } from '../translations';
 import { soundManager } from '../utils/sound';
 import { storage } from '../utils/storage';
+import { selectQuizQuestions } from '../utils/quizSelector';
 
 interface Props {
   language: Language;
@@ -48,23 +51,19 @@ export const MCQPracticeView: React.FC<Props> = ({
   const [selectedDifficulty, setSelectedDifficulty] = useState<string>('all');
   const [mode, setMode] = useState<'practice' | 'mock'>('practice');
 
-  // Filtered pool of questions
-  const filteredQuestions = questions.filter(q => {
-    if (selectedSubject !== 'all' && q.subject !== selectedSubject) return false;
-    if (selectedDifficulty !== 'all' && q.difficulty !== selectedDifficulty) return false;
-    return true;
-  });
+  // Stable session quiz questions (never re-shuffles on render or navigation)
+  const [quizQuestions, setQuizQuestions] = useState<MCQQuestion[]>([]);
+  const [poolNotice, setPoolNotice] = useState<string | null>(null);
+  const [unattemptedCount, setUnattemptedCount] = useState<number>(0);
+  const [totalEligibleCount, setTotalEligibleCount] = useState<number>(0);
 
-  // Current session states
+  // Current session navigation & answers
   const [currentIndex, setCurrentIndex] = useState(0);
   const [selectedOption, setSelectedOption] = useState<number | null>(null);
   const [showExplanation, setShowExplanation] = useState(false);
-
-  // User answers map for the test session
   const [sessionAnswers, setSessionAnswers] = useState<Record<string, number | null>>({});
-  const [markedForReview, setMarkedForReview] = useState<Record<string, boolean>>({});
 
-  // Mock test timer
+  // Mock test timer & status
   const [isTestStarted, setIsTestStarted] = useState(false);
   const [testTimeRemaining, setTestTimeRemaining] = useState(15 * 60); // 15 mins default
   const [isTestSubmitted, setIsTestSubmitted] = useState(false);
@@ -88,15 +87,47 @@ export const MCQPracticeView: React.FC<Props> = ({
   const [customExplMr, setCustomExplMr] = useState('');
   const [customSubject, setCustomSubject] = useState('polity');
 
-  // Current active question
-  const activeQuestions = reviewOnlyIncorrect && completedSession
-    ? questions.filter(q => {
-        const record = completedSession.answers.find(a => a.questionId === q.id);
-        return record && !record.isCorrect;
-      })
-    : filteredQuestions;
+  // Initialize practice drill session with non-duplicate questions
+  const loadPracticeDrill = (sub = selectedSubject, diff = selectedDifficulty) => {
+    const recentAttempted = storage.getRecentAttemptedQuestionIds();
+    const result = selectQuizQuestions({
+      pool: questions,
+      filters: { subject: sub, difficulty: diff },
+      requestedCount: 10,
+      recentAttemptedIds: recentAttempted,
+    });
 
-  const currentQuestion = activeQuestions[currentIndex] || activeQuestions[0];
+    setQuizQuestions(result.questions);
+    setPoolNotice(result.notice || null);
+    setUnattemptedCount(result.unattemptedCount);
+    setTotalEligibleCount(result.totalEligibleCount);
+    setCurrentIndex(0);
+    setSelectedOption(null);
+    setShowExplanation(false);
+    setSessionAnswers({});
+    setReviewOnlyIncorrect(false);
+  };
+
+  // Sync when filters change or mode changes
+  useEffect(() => {
+    if (mode === 'practice' && !reviewOnlyIncorrect) {
+      loadPracticeDrill(selectedSubject, selectedDifficulty);
+    } else if (mode === 'mock' && !isTestStarted && !isTestSubmitted) {
+      const recentAttempted = storage.getRecentAttemptedQuestionIds();
+      const result = selectQuizQuestions({
+        pool: questions,
+        filters: { subject: selectedSubject, difficulty: selectedDifficulty },
+        requestedCount: 20,
+        recentAttemptedIds: recentAttempted,
+      });
+      setTotalEligibleCount(result.totalEligibleCount);
+      setUnattemptedCount(result.unattemptedCount);
+      setPoolNotice(result.notice || null);
+    }
+  }, [selectedSubject, selectedDifficulty, mode, questions]);
+
+  // Current active question
+  const currentQuestion = quizQuestions[currentIndex] || quizQuestions[0];
 
   // Timer countdown for Mock Test
   useEffect(() => {
@@ -117,8 +148,10 @@ export const MCQPracticeView: React.FC<Props> = ({
 
   // Option selection handler
   const handleSelectOption = (idx: number) => {
+    if (!currentQuestion) return;
+
     if (mode === 'practice') {
-      if (selectedOption !== null) return; // Already chosen
+      if (selectedOption !== null) return; // Already chosen for this question
       setSelectedOption(idx);
       setShowExplanation(true);
 
@@ -129,11 +162,14 @@ export const MCQPracticeView: React.FC<Props> = ({
         soundManager.playWrong();
       }
 
-      // Record to answers map
+      // Record to session answers map
       setSessionAnswers(prev => ({
         ...prev,
         [currentQuestion.id]: idx,
       }));
+
+      // Record question ID to persistent attempted list so it won't repeat in next drills until pool is exhausted
+      storage.recordAttemptedQuestionIds([currentQuestion.id]);
     } else {
       // In Mock Test Mode, allow switching answers until submission
       soundManager.playClick();
@@ -144,13 +180,14 @@ export const MCQPracticeView: React.FC<Props> = ({
     }
   };
 
-  // Navigation handlers
+  // Navigation handlers (preserves exact question list and chosen answers without re-shuffling)
   const handleNext = () => {
     soundManager.playClick();
-    if (currentIndex < activeQuestions.length - 1) {
-      setCurrentIndex(prev => prev + 1);
+    if (currentIndex < quizQuestions.length - 1) {
+      const nextIdx = currentIndex + 1;
+      setCurrentIndex(nextIdx);
       if (mode === 'practice') {
-        const nextQ = activeQuestions[currentIndex + 1];
+        const nextQ = quizQuestions[nextIdx];
         const prevAnswer = sessionAnswers[nextQ?.id];
         setSelectedOption(prevAnswer !== undefined ? prevAnswer : null);
         setShowExplanation(prevAnswer !== undefined);
@@ -161,9 +198,10 @@ export const MCQPracticeView: React.FC<Props> = ({
   const handlePrev = () => {
     soundManager.playClick();
     if (currentIndex > 0) {
-      setCurrentIndex(prev => prev - 1);
+      const prevIdx = currentIndex - 1;
+      setCurrentIndex(prevIdx);
       if (mode === 'practice') {
-        const prevQ = activeQuestions[currentIndex - 1];
+        const prevQ = quizQuestions[prevIdx];
         const prevAnswer = sessionAnswers[prevQ?.id];
         setSelectedOption(prevAnswer !== undefined ? prevAnswer : null);
         setShowExplanation(prevAnswer !== undefined);
@@ -171,14 +209,23 @@ export const MCQPracticeView: React.FC<Props> = ({
     }
   };
 
-  // Start a new mock test
+  // Start a new mock test with unique random questions
   const startMockExam = () => {
     soundManager.playClick();
+    const recentAttempted = storage.getRecentAttemptedQuestionIds();
+    const result = selectQuizQuestions({
+      pool: questions,
+      filters: { subject: selectedSubject, difficulty: selectedDifficulty },
+      requestedCount: 20,
+      recentAttemptedIds: recentAttempted,
+    });
+
+    setQuizQuestions(result.questions);
+    setPoolNotice(result.notice || null);
     setIsTestStarted(true);
     setIsTestSubmitted(false);
     setCompletedSession(null);
     setSessionAnswers({});
-    setMarkedForReview({});
     setCurrentIndex(0);
     setTestTimeRemaining(15 * 60);
     setReviewOnlyIncorrect(false);
@@ -194,7 +241,7 @@ export const MCQPracticeView: React.FC<Props> = ({
     let incorrect = 0;
     let skipped = 0;
 
-    const answerRecords: QuestionAnswerRecord[] = activeQuestions.map(q => {
+    const answerRecords: QuestionAnswerRecord[] = quizQuestions.map(q => {
       const selected = sessionAnswers[q.id];
       if (selected === undefined || selected === null) {
         skipped++;
@@ -209,7 +256,7 @@ export const MCQPracticeView: React.FC<Props> = ({
       return { questionId: q.id, selectedOption: selected, isCorrect };
     });
 
-    const total = activeQuestions.length;
+    const total = quizQuestions.length;
     const scorePct = total > 0 ? Math.round((correct / total) * 100) : 0;
     const timeSpent = 15 * 60 - testTimeRemaining;
 
@@ -231,6 +278,9 @@ export const MCQPracticeView: React.FC<Props> = ({
     storage.saveTestSession(session);
     onTestComplete(session);
 
+    // Track all questions from this mock test in localStorage so they won't repeat in next tests until exhausted
+    storage.recordAttemptedQuestionIds(quizQuestions.map(q => q.id));
+
     if (scorePct >= 70) {
       confetti({
         particleCount: 80,
@@ -240,16 +290,64 @@ export const MCQPracticeView: React.FC<Props> = ({
     }
   };
 
-  // Retry only incorrect questions
+  // Retry only incorrect questions from this test in a fresh random order
   const handleRetryIncorrect = () => {
     if (!completedSession) return;
     soundManager.playClick();
-    setReviewOnlyIncorrect(false);
+
+    const incorrectIds = completedSession.answers
+      .filter(a => !a.isCorrect)
+      .map(a => a.questionId);
+
+    if (incorrectIds.length === 0) return;
+
+    // Use selectQuizQuestions with specificQuestionIds to create a fresh randomized order without duplicates
+    const result = selectQuizQuestions({
+      pool: questions,
+      specificQuestionIds: incorrectIds,
+    });
+
+    setQuizQuestions(result.questions);
+    setReviewOnlyIncorrect(true);
     setIsTestSubmitted(false);
     setIsTestStarted(true);
     setSessionAnswers({});
     setCurrentIndex(0);
-    setTestTimeRemaining(10 * 60);
+    setSelectedOption(null);
+    setShowExplanation(false);
+    setTestTimeRemaining(Math.max(5, incorrectIds.length) * 60);
+  };
+
+  // Review mode for explanations only
+  const handleReviewExplanationsOnly = () => {
+    if (!completedSession) return;
+    soundManager.playClick();
+
+    const incorrectIds = completedSession.answers
+      .filter(a => !a.isCorrect)
+      .map(a => a.questionId);
+
+    const result = selectQuizQuestions({
+      pool: questions,
+      specificQuestionIds: incorrectIds,
+    });
+
+    setQuizQuestions(result.questions);
+    setReviewOnlyIncorrect(true);
+    setIsTestSubmitted(false);
+    setIsTestStarted(false);
+    setMode('practice');
+    setCurrentIndex(0);
+    setShowExplanation(true);
+  };
+
+  // Reset recent attempted question history to start fresh
+  const handleResetAttemptHistory = () => {
+    if (confirm(language === 'mr' ? 'सराव केलेल्या प्रश्नांचा इतिहास रीसेट करायचा आहे का? सर्व प्रश्न पुन्हा नव्याने उपलब्ध होतील.' : 'Reset attempted question history? All questions will be available fresh.')) {
+      storage.clearRecentAttemptedQuestionIds();
+      soundManager.playSuccess();
+      loadPracticeDrill(selectedSubject, selectedDifficulty);
+    }
   };
 
   // Add custom question submission
@@ -286,7 +384,6 @@ export const MCQPracticeView: React.FC<Props> = ({
 
     onAddCustomQuestion(newQ);
     setIsAddModalOpen(false);
-    // Reset inputs
     setCustomQuestionEn('');
     setCustomQuestionMr('');
     setOpt1En(''); setOpt2En(''); setOpt3En(''); setOpt4En('');
@@ -294,7 +391,6 @@ export const MCQPracticeView: React.FC<Props> = ({
     setCustomExplEn(''); setCustomExplMr('');
   };
 
-  // Timer format
   const formatTimer = (secs: number) => {
     const m = Math.floor(secs / 60);
     const s = secs % 60;
@@ -322,7 +418,18 @@ export const MCQPracticeView: React.FC<Props> = ({
             </p>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center flex-wrap gap-2">
+            {mode === 'practice' && (
+              <button
+                onClick={() => loadPracticeDrill(selectedSubject, selectedDifficulty)}
+                className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-bold bg-indigo-50 dark:bg-indigo-950/60 text-indigo-700 dark:text-indigo-300 hover:bg-indigo-100 dark:hover:bg-indigo-900/60 transition cursor-pointer"
+                title={language === 'mr' ? 'नवीन सराव संच लोड करा' : 'Load new drill set'}
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                <span>{language === 'mr' ? 'नवीन प्रश्न संच' : 'New Drill Set'}</span>
+              </button>
+            )}
+
             <button
               onClick={() => setIsAddModalOpen(true)}
               className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-bold bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700 transition cursor-pointer"
@@ -342,6 +449,8 @@ export const MCQPracticeView: React.FC<Props> = ({
                 setMode('practice');
                 setIsTestStarted(false);
                 setIsTestSubmitted(false);
+                setReviewOnlyIncorrect(false);
+                loadPracticeDrill(selectedSubject, selectedDifficulty);
               }}
               className={`flex-1 py-1.5 px-3 rounded-lg transition text-center cursor-pointer ${mode === 'practice' ? 'bg-white dark:bg-slate-900 text-indigo-600 dark:text-indigo-400 shadow-xs' : 'text-slate-600 dark:text-slate-400'}`}
             >
@@ -351,6 +460,9 @@ export const MCQPracticeView: React.FC<Props> = ({
               onClick={() => {
                 setMode('mock');
                 setCurrentIndex(0);
+                setIsTestStarted(false);
+                setIsTestSubmitted(false);
+                setReviewOnlyIncorrect(false);
               }}
               className={`flex-1 py-1.5 px-3 rounded-lg transition text-center cursor-pointer ${mode === 'mock' ? 'bg-white dark:bg-slate-900 text-indigo-600 dark:text-indigo-400 shadow-xs' : 'text-slate-600 dark:text-slate-400'}`}
             >
@@ -358,15 +470,16 @@ export const MCQPracticeView: React.FC<Props> = ({
             </button>
           </div>
 
-          {/* Subject Filter */}
-          <div className="flex items-center gap-2">
+          {/* Subject & Difficulty Filter */}
+          <div className="flex items-center flex-wrap gap-2">
             <select
               value={selectedSubject}
               onChange={(e) => {
-                setSelectedSubject(e.target.value);
-                setCurrentIndex(0);
-                setSelectedOption(null);
-                setShowExplanation(false);
+                const newSub = e.target.value;
+                setSelectedSubject(newSub);
+                if (mode === 'practice') {
+                  loadPracticeDrill(newSub, selectedDifficulty);
+                }
               }}
               className="p-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-xs font-semibold text-slate-800 dark:text-slate-200"
             >
@@ -384,8 +497,11 @@ export const MCQPracticeView: React.FC<Props> = ({
             <select
               value={selectedDifficulty}
               onChange={(e) => {
-                setSelectedDifficulty(e.target.value);
-                setCurrentIndex(0);
+                const newDiff = e.target.value;
+                setSelectedDifficulty(newDiff);
+                if (mode === 'practice') {
+                  loadPracticeDrill(selectedSubject, newDiff);
+                }
               }}
               className="p-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-xs font-semibold text-slate-800 dark:text-slate-200"
             >
@@ -394,8 +510,25 @@ export const MCQPracticeView: React.FC<Props> = ({
               <option value="medium">{t.diffMedium}</option>
               <option value="hard">{t.diffHard}</option>
             </select>
+
+            <button
+              onClick={handleResetAttemptHistory}
+              className="p-2 rounded-xl text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 text-xs transition cursor-pointer"
+              title={language === 'mr' ? 'अभ्यास केलेला प्रश्न इतिहास रीसेट करा' : 'Reset question history cycle'}
+            >
+              <RotateCcw className="w-3.5 h-3.5 inline mr-1" />
+              <span className="hidden lg:inline">{language === 'mr' ? 'इतिहास रीसेट' : 'Reset History'}</span>
+            </button>
           </div>
         </div>
+
+        {/* Pool notice banner when questions are fewer than requested or exhaustion notice */}
+        {poolNotice && (
+          <div className="mt-3 flex items-center gap-2 p-2.5 rounded-xl bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800 text-blue-800 dark:text-blue-200 text-xs">
+            <Info className="w-4 h-4 shrink-0 text-blue-600" />
+            <span>{poolNotice}</span>
+          </div>
+        )}
       </div>
 
       {/* Mock Test Welcome Screen if mode is mock and test hasn't started */}
@@ -409,13 +542,15 @@ export const MCQPracticeView: React.FC<Props> = ({
           </h3>
           <p className="text-xs text-slate-500 dark:text-slate-400 mt-2 leading-relaxed">
             {language === 'mr' 
-              ? 'आयोगाच्या परीक्षेप्रमाणे वेळेचे व्यवस्थापन शिकण्यासाठी ही मॉक टेस्ट द्या. एकूण प्रश्न, वेळ मर्यादा व शेवटी अचूकता अहवाल मिळेल.' 
-              : 'Simulate official exam pressure with a timed countdown, question palette, and detailed performance breakdown.'}
+              ? 'आयोगाच्या परीक्षेप्रमाणे वेळेचे व्यवस्थापन शिकण्यासाठी ही मॉक टेस्ट द्या. प्रश्न यादृच्छिकपणे निवडले जातात व चाचणीत कोणताही प्रश्न पुन्हा येत नाही.' 
+              : 'Simulate official exam pressure with a timed countdown, question palette, and distinct non-repeating questions.'}
           </p>
 
           <div className="grid grid-cols-3 gap-3 my-6 text-center text-xs">
             <div className="bg-slate-50 dark:bg-slate-800/80 p-3 rounded-2xl border border-slate-100 dark:border-slate-700">
-              <span className="font-extrabold text-indigo-600 text-lg block">{activeQuestions.length}</span>
+              <span className="font-extrabold text-indigo-600 text-lg block">
+                {Math.min(20, totalEligibleCount || 20)}
+              </span>
               <span className="text-slate-400">{t.question}</span>
             </div>
             <div className="bg-slate-50 dark:bg-slate-800/80 p-3 rounded-2xl border border-slate-100 dark:border-slate-700">
@@ -423,8 +558,8 @@ export const MCQPracticeView: React.FC<Props> = ({
               <span className="text-slate-400">{language === 'mr' ? 'वेळ' : 'Duration'}</span>
             </div>
             <div className="bg-slate-50 dark:bg-slate-800/80 p-3 rounded-2xl border border-slate-100 dark:border-slate-700">
-              <span className="font-extrabold text-amber-500 text-lg block">100%</span>
-              <span className="text-slate-400">{language === 'mr' ? 'मोफत' : 'Free'}</span>
+              <span className="font-extrabold text-emerald-600 text-lg block">0</span>
+              <span className="text-slate-400">{language === 'mr' ? 'पुनरावृत्ती' : 'Duplicates'}</span>
             </div>
           </div>
 
@@ -481,27 +616,31 @@ export const MCQPracticeView: React.FC<Props> = ({
 
           <div className="space-y-3">
             {completedSession.incorrectCount > 0 && (
-              <button
-                onClick={() => {
-                  setReviewOnlyIncorrect(true);
-                  setIsTestSubmitted(false);
-                  setMode('practice');
-                  setCurrentIndex(0);
-                  setShowExplanation(true);
-                }}
-                className="w-full py-3 px-4 rounded-2xl bg-rose-50 hover:bg-rose-100 dark:bg-rose-950/60 dark:hover:bg-rose-900/60 text-rose-700 dark:text-rose-300 font-bold text-xs border border-rose-200 dark:border-rose-800 transition active:scale-98 cursor-pointer flex items-center justify-center gap-2"
-              >
-                <XCircle className="w-4 h-4" />
-                <span>{t.reviewIncorrect} ({completedSession.incorrectCount})</span>
-              </button>
+              <>
+                <button
+                  onClick={handleReviewExplanationsOnly}
+                  className="w-full py-3 px-4 rounded-2xl bg-amber-50 hover:bg-amber-100 dark:bg-amber-950/60 dark:hover:bg-amber-900/60 text-amber-800 dark:text-amber-200 font-bold text-xs border border-amber-200 dark:border-amber-800 transition active:scale-98 cursor-pointer flex items-center justify-center gap-2"
+                >
+                  <Eye className="w-4 h-4" />
+                  <span>{t.reviewIncorrect} ({completedSession.incorrectCount})</span>
+                </button>
+
+                <button
+                  onClick={handleRetryIncorrect}
+                  className="w-full py-3 px-4 rounded-2xl bg-rose-50 hover:bg-rose-100 dark:bg-rose-950/60 dark:hover:bg-rose-900/60 text-rose-700 dark:text-rose-300 font-bold text-xs border border-rose-200 dark:border-rose-800 transition active:scale-98 cursor-pointer flex items-center justify-center gap-2"
+                >
+                  <RotateCcw className="w-4 h-4" />
+                  <span>{t.retryIncorrect} ({completedSession.incorrectCount})</span>
+                </button>
+              </>
             )}
 
             <button
               onClick={startMockExam}
               className="w-full py-3 px-4 rounded-2xl bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-xs shadow-md transition active:scale-98 cursor-pointer flex items-center justify-center gap-2"
             >
-              <RotateCcw className="w-4 h-4" />
-              <span>{t.takeAnotherTest}</span>
+              <RefreshCw className="w-4 h-4" />
+              <span>{t.takeAnotherTest} (नवीन प्रश्न संच)</span>
             </button>
           </div>
         </div>
@@ -515,11 +654,16 @@ export const MCQPracticeView: React.FC<Props> = ({
           <div className="flex items-center justify-between gap-3 pb-3 border-b border-slate-100 dark:border-slate-800">
             <div className="flex items-center gap-2">
               <span className="px-2.5 py-1 rounded-lg text-xs font-bold bg-indigo-50 dark:bg-indigo-950 text-indigo-600 dark:text-indigo-400">
-                {t.question} {currentIndex + 1} {t.of} {activeQuestions.length}
+                {t.question} {currentIndex + 1} {t.of} {quizQuestions.length}
               </span>
               <span className="text-xs font-semibold px-2 py-0.5 rounded-md bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300">
                 {currentQuestion.subject.toUpperCase()}
               </span>
+              {currentQuestion.topic && (
+                <span className="hidden sm:inline text-[11px] text-slate-400 font-medium">
+                  • {currentQuestion.topic}
+                </span>
+              )}
             </div>
 
             <div className="flex items-center gap-3">
@@ -647,13 +791,36 @@ export const MCQPracticeView: React.FC<Props> = ({
 
             <button
               onClick={handleNext}
-              disabled={currentIndex === activeQuestions.length - 1}
+              disabled={currentIndex === quizQuestions.length - 1}
               className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-bold bg-indigo-600 hover:bg-indigo-700 text-white disabled:opacity-40 shadow transition cursor-pointer"
             >
               <span>{t.next}</span>
               <ChevronRight className="w-4 h-4" />
             </button>
           </div>
+        </div>
+      )}
+
+      {/* When no questions found for filter */}
+      {quizQuestions.length === 0 && !isTestSubmitted && (
+        <div className="bg-white dark:bg-slate-900 rounded-3xl p-8 border border-slate-200 dark:border-slate-800 text-center">
+          <AlertCircle className="w-10 h-10 text-amber-500 mx-auto mb-2" />
+          <h3 className="text-base font-bold text-slate-900 dark:text-white mb-1">
+            {language === 'mr' ? 'या निवडीसाठी प्रश्न उपलब्ध नाहीत' : 'No Questions Found'}
+          </h3>
+          <p className="text-xs text-slate-500 max-w-md mx-auto mb-4">
+            {language === 'mr' ? 'कृपया फिल्टर बदला किंवा सर्व विषय निवडा.' : 'Please change filters or select All Subjects.'}
+          </p>
+          <button
+            onClick={() => {
+              setSelectedSubject('all');
+              setSelectedDifficulty('all');
+              loadPracticeDrill('all', 'all');
+            }}
+            className="px-4 py-2 rounded-xl bg-indigo-600 text-white font-bold text-xs cursor-pointer"
+          >
+            {language === 'mr' ? 'सर्व विषय निवडा' : 'Select All Subjects'}
+          </button>
         </div>
       )}
 

@@ -57,6 +57,7 @@ export interface MCQQuestion {
   explanationEn: string;
   explanationMr: string;
   difficulty: 'easy' | 'medium' | 'hard';
+  topic?: string;
   tags: string[];
   isSample: boolean;
 }
